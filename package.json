@@ -1,0 +1,14 @@
+{
+  "name": "dx1-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Background service: lets the M5Cardputer-Adv control a TOPPING DX1 II over Bluetooth hotkeys, independent of window focus.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "node-hid": "^3.1.0",
+    "node-global-key-listener": "^0.3.0"
+  }
+}
