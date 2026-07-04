@@ -51,6 +51,24 @@
   the original character such as '/'. Therefore local Fn settings are handled
   with Keyboard.isKeyPressed(KEY_FN) + Keyboard.isKeyPressed('<physical key>')
   instead of looping over status.word.
+
+  ---------------------------------------------------------------------
+  Battery display (this revision):
+  ---------------------------------------------------------------------
+  Cardputer-Adv exposes its fuel-gauge readout through M5Unified's Power
+  class, which the M5Cardputer object already inherits - no extra library
+  needed. getBatteryLevel() returns 0-100, or -1 if the gauge hasn't
+  produced a reading yet (right at boot). isCharging() returns an enum,
+  not a plain bool (1 = charging, 0 = discharging, -1 = unknown), so it's
+  read into an int8_t and compared explicitly rather than truthiness-cast.
+
+  The reading is polled on a timer (kBatteryPollIntervalMs) instead of
+  every loop() iteration, since the ADC/gauge is happy being read
+  occasionally and this avoids needless redraws. A poll only triggers a
+  redraw if the level or charge state actually changed AND the screen is
+  currently on - a battery-only change should never wake the screen, only
+  key activity should.
+  ---------------------------------------------------------------------
 */
 
 #include <M5Cardputer.h>
@@ -131,6 +149,12 @@ static String peerAddressText = "";  // filled in on connect, see note below
 
 static const uint8_t kScreenBrightness = 80;
 
+// --- Battery state ---------------------------------------------------
+static int32_t batteryLevel = -1;      // 0-100, -1 = unknown/not ready yet
+static bool batteryCharging = false;
+static unsigned long lastBatteryPollMs = 0;
+static const unsigned long kBatteryPollIntervalMs = 10000;  // 10s
+
 /*
   Why an address and not a friendly device name: standard BLE HID only lets
   the peripheral (the Cardputer) read the connected central's Bluetooth
@@ -151,6 +175,66 @@ void updatePeerAddress() {
   peerAddressText = String(info.getAddress().toString().c_str());
 }
 
+// Reads the fuel gauge. Returns true if level or charge state changed.
+bool refreshBatteryStatus() {
+  int32_t level = M5Cardputer.Power.getBatteryLevel();  // 0-100, or -1
+  int8_t chg = M5Cardputer.Power.isCharging();           // 1/0/-1
+  bool charging = (chg == 1);
+
+  bool changed = (level != batteryLevel) || (charging != batteryCharging);
+  batteryLevel = level;
+  batteryCharging = charging;
+  return changed;
+}
+
+// Small battery pill icon, top-right anchored at (xRight, y). Draws the
+// outline + nub + proportional fill, plus a "+" when charging and a "?"
+// when the gauge hasn't produced a reading yet.
+void drawBatteryIcon(int xRight, int y, int level, bool charging) {
+  auto &lcd = M5Cardputer.Display;
+  const int w = 22, h = 11, nub = 4;
+  const int x = xRight - w - 3;  // leave room for the nub on the right
+
+  const uint16_t frameColor = 0xC618;  // light gray
+
+  lcd.drawRect(x, y, w, h, frameColor);
+  lcd.fillRect(x + w, y + (h - nub) / 2, 2, nub, frameColor);
+
+  // Clear the interior before filling / drawing "?" so old fill doesn't
+  // show through on redraw.
+  lcd.fillRect(x + 2, y + 2, w - 4, h - 4, BLACK);
+
+  if (level < 0) {
+    lcd.setFont(&fonts::efontCN_12);
+    lcd.setTextColor(0x7BEF, BLACK);
+    lcd.setCursor(x + w / 2 - 3, y - 1);
+    lcd.print("?");
+    return;
+  }
+
+  uint16_t fillColor;
+  if (level <= 15) {
+    fillColor = RED;
+  } else if (level <= 40) {
+    fillColor = YELLOW;
+  } else {
+    fillColor = GREEN;
+  }
+
+  int innerW = w - 4;
+  int fillW = (innerW * level) / 100;
+  if (fillW > 0) {
+    lcd.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
+  }
+
+  if (charging) {
+    lcd.setFont(&fonts::efontCN_12);
+    lcd.setTextColor(YELLOW, BLACK);
+    lcd.setCursor(x - 12, y - 1);
+    lcd.print("+");
+  }
+}
+
 void wakeScreen() {
   if (screenOff) {
     screenOff = false;
@@ -166,6 +250,10 @@ void drawStatusPage() {
   lcd.setTextColor(WHITE, BLACK);
   lcd.setCursor(4, y);
   lcd.print("DX1 II 蓝牙遥控");
+
+  // Battery pill, top-right corner of the title row.
+  drawBatteryIcon(lcd.width() - 4, y + 2, batteryLevel, batteryCharging);
+
   y += 20;
 
   lcd.setFont(&fonts::efontCN_14);
@@ -174,6 +262,20 @@ void drawStatusPage() {
   lcd.setTextColor(connected ? GREEN : RED, BLACK);
   lcd.setCursor(4, y);
   lcd.print(connected ? "蓝牙: 已连接" : "蓝牙: 等待PC连接...");
+
+  // Battery percentage text, right-aligned on the same row as BLE status.
+  lcd.setTextColor(0xC618, BLACK);
+  char battText[16];
+  if (batteryLevel < 0) {
+    snprintf(battText, sizeof(battText), "电量: --");
+  } else {
+    snprintf(battText, sizeof(battText), "电量: %ld%%%s",
+             (long)batteryLevel, batteryCharging ? " 充电中" : "");
+  }
+  int battTextW = lcd.textWidth(battText);
+  lcd.setCursor(lcd.width() - battTextW - 4, y);
+  lcd.print(battText);
+
   y += 17;
 
   lcd.setTextColor(0xC618, BLACK);  // light gray
@@ -215,6 +317,11 @@ void drawLegendPage() {
   lcd.setTextColor(WHITE, BLACK);
   lcd.setCursor(4, y);
   lcd.print("按键说明 (Fn+/ 返回)");
+
+  // Keep the battery pill visible on this page too, so it's always
+  // glanceable regardless of which page you're on.
+  drawBatteryIcon(lcd.width() - 4, y + 2, batteryLevel, batteryCharging);
+
   y += 20;
 
   lcd.setFont(&fonts::efontCN_12);
@@ -398,6 +505,12 @@ void setup() {
 
   bleKeyboard.begin();
 
+  // Prime the battery reading once before the first draw so the icon
+  // doesn't start life on the "?" placeholder if a reading is already
+  // available at boot.
+  refreshBatteryStatus();
+  lastBatteryPollMs = millis();
+
   lastActivityMs = millis();
   drawUI();
 }
@@ -422,6 +535,17 @@ void loop() {
     wakeScreen();
     lastActivityMs = millis();
     drawUI();
+  }
+
+  // Poll the battery gauge on its own timer, independent of key/BLE
+  // activity. Only redraw if something actually changed, and only if the
+  // screen is already on - a battery-only change must never wake it.
+  if (millis() - lastBatteryPollMs > kBatteryPollIntervalMs) {
+    lastBatteryPollMs = millis();
+
+    if (refreshBatteryStatus() && !screenOff) {
+      drawUI();
+    }
   }
 
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
