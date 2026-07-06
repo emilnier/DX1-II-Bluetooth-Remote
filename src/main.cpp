@@ -1,50 +1,19 @@
 /*
   DX1 II Bluetooth Remote for M5Stack Cardputer-Adv
-  ==================================================
+  Power-optimized revision
 
-  Three independent things happen over the same BLE HID connection:
-
-  1. DX1 II control combos (Ctrl+Alt+<key>) -> caught by a background
-     Node.js service on the PC (see dx1_bridge/), which talks to the DX1 II
-     directly over USB via node-hid. Because that service uses a global
-     keyboard hook (node-global-key-listener) instead of a browser keydown
-     listener, these work NO MATTER which window has focus on the PC.
-
-  2. Media transport keys (P/N/B) are sent as real HID "Consumer Control"
-     media keys (Play/Pause, Next, Previous). Every OS already routes those
-     globally to whatever app owns the current media session - no companion
-     software needed at all, and no focus requirement either.
-
-  3. Fn+<key> combos are LOCAL settings for the Cardputer itself (auto
-     screen-off, page switching) - nothing is sent over Bluetooth for these,
-     they just change how the Cardputer's own screen behaves.
-
-  Key map:
-    C            Ctrl+Alt+C   Connect
-    X            Ctrl+Alt+X   Disconnect
-    1 / 2        Ctrl+Alt+1/2 Volume -/+
-    M            Ctrl+Alt+M   Mute toggle
-    I            Ctrl+Alt+I   Input toggle
-    O            Ctrl+Alt+O   Output cycle
-    P            Media key    Play / Pause
-    N            Media key    Next track
-    B            Media key    Previous track
-    Fn+S         Local        Auto screen-off: on/off
-    Fn+, / Fn+.  Local        Auto screen-off timeout: shorter / longer
-    Fn+/         Local        Switch screen page
-
-  Power-saving revision:
-  ----------------------
-  本版在不改变原功能的基础上，主要做了以下省电优化：
-
-  1. 关闭未使用的 WiFi。
-  2. 将 ESP32-S3 CPU 频率降到 80 MHz，保留 BLE HID 与键盘扫描稳定性。
-  3. 降低 BLE 发射功率，适合近距离遥控场景。
-  4. 降低默认屏幕亮度。
-  5. 电量轮询从 10 秒延长到 30 秒，减少 I2C/电源管理读取频率。
-  6. loop 空闲延时改为自适应：亮屏/连接/熄屏时使用不同轮询间隔，减少 CPU 空转。
-  7. 保留原有自动熄屏逻辑，电量变化不会主动唤醒屏幕。
+  Main changes:
+  1. Force ESP32-BLE-Keyboard to use NimBLE mode.
+  2. Fix BLE TX power setting: use dBm value for NimBLEDevice::setPower().
+  3. Disable unused M5 internal peripherals: speaker, mic, IMU.
+  4. Keep WiFi fully off.
+  5. Lower default brightness and add Fn+L brightness presets.
+  6. Report real battery level to BLE HID Battery Service.
+  7. Use longer battery polling while screen is off.
+  8. Wake screen on any key press, but only redraw when needed.
 */
+
+
 
 #include <M5Cardputer.h>
 
@@ -71,7 +40,8 @@
 #include <BleKeyboard.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
-#include <WiFi.h>   // 省电优化：用于关闭未使用的 WiFi 射频。
+#include <WiFi.h>
+#include <esp_wifi.h>
 
 BleKeyboard bleKeyboard("DX1II Remote", "M5Stack", 100);
 Preferences prefs;
@@ -111,10 +81,19 @@ static const size_t kMediaActionCount = sizeof(kMediaActions) / sizeof(kMediaAct
 static const uint16_t kSleepPresetsSec[] = {10, 30, 60, 120, 300};
 static const size_t kSleepPresetCount = sizeof(kSleepPresetsSec) / sizeof(kSleepPresetsSec[0]);
 
+// 新增：亮度档位。默认使用 45，续航优先；需要更亮可 Fn+L 切换。
+static const uint8_t kBrightnessPresets[] = {25, 45, 70, 100};
+static const size_t kBrightnessPresetCount = sizeof(kBrightnessPresets) / sizeof(kBrightnessPresets[0]);
+
 static bool autoSleepEnabled = true;
 static uint8_t sleepPresetIndex = 1;
+static uint8_t brightnessPresetIndex = 1;
 static bool screenOff = false;
 static unsigned long lastActivityMs = 0;
+
+// 如果你实测 Display.sleep()/wakeup() 稳定，可改成 true 进一步降低屏幕控制器功耗。
+// 默认 false：只关背光，稳定性最好。
+static const bool kUseDisplaySleep = false;
 
 // 0 = status page, 1 = key legend page
 static uint8_t currentPage = 0;
@@ -123,55 +102,66 @@ static String lastActionText = "等待按键...";
 static bool lastConnectedState = false;
 static String peerAddressText = "";
 
-// 省电优化：原值为 80。降低亮度能明显减少屏幕背光耗电。
-// 如果你觉得屏幕偏暗，可以改回 70 或 80。
-static const uint8_t kScreenBrightness = 55;
-
-// 省电优化：ESP32-S3 降频到 80 MHz。
-// 这个频率对 BLE HID、按键扫描、屏幕刷新通常足够，且比默认高频更省电。
-// 不建议降到 40 MHz，可能影响 BLE 稳定性或屏幕/I2C响应。
+// ESP32-S3 降频到 80 MHz。继续降低到 40 MHz 可能影响 BLE/I2C/SPI 响应。
 static const uint32_t kCpuFrequencyMhz = 80;
 
-// 省电优化：BLE 发射功率降低，适合 Cardputer 与电脑近距离使用。
-// 如果连接距离较远或断连，把 ESP_PWR_LVL_N3 改成 ESP_PWR_LVL_P3 或 ESP_PWR_LVL_P6。
-static const esp_power_level_t kBleTxPower = ESP_PWR_LVL_N3;
+// NimBLEDevice::setPower() 严格要求传入 esp_power_level_t 枚举类型，而不是普通的 int8_t 整数
+static const esp_power_level_t kBleTxPowerDbm = ESP_PWR_LVL_P3;
 
-// --- Battery state ---------------------------------------------------
+// Battery state
 static int32_t batteryLevel = -1;
 static bool batteryCharging = false;
 static unsigned long lastBatteryPollMs = 0;
 
-// 省电优化：原来 10 秒轮询一次电量。
-// 电量显示不需要很高实时性，改成 30 秒可减少不必要的电源读取和刷新。
-static const unsigned long kBatteryPollIntervalMs = 30000;
+// 亮屏时 30 秒；熄屏时 120 秒。熄屏时电量显示不可见，没有必要频繁读取。
+static const unsigned long kBatteryPollAwakeMs = 30000;
+static const unsigned long kBatteryPollScreenOffMs = 120000;
 
-// 省电优化：自适应 loop 延时，减少 CPU 空转。
-// 亮屏且已连接时保持较快响应；未连接或熄屏时降低轮询频率。
-// 如果你感觉按键响应变慢，可把这些数值适当调小。
+// 自适应 loop 延时。熄屏时适当放慢，但不要太大，避免键盘 FIFO 在连续按键时堆积。
 static const uint16_t kLoopDelayConnectedMs = 8;
-static const uint16_t kLoopDelayDisconnectedMs = 12;
-static const uint16_t kLoopDelayScreenOffMs = 20;
+static const uint16_t kLoopDelayDisconnectedMs = 15;
+static const uint16_t kLoopDelayScreenOffConnectedMs = 18;
+static const uint16_t kLoopDelayScreenOffDisconnectedMs = 30;
+
+uint8_t currentBrightness() {
+  if (brightnessPresetIndex >= kBrightnessPresetCount) {
+    brightnessPresetIndex = 1;
+  }
+  return kBrightnessPresets[brightnessPresetIndex];
+}
 
 void applyPowerSavingConfigBeforeBle() {
-  // 省电优化：本固件不使用 WiFi，关闭 WiFi 射频。
+  // 本固件不使用 WiFi。disconnect + WIFI_OFF + esp_wifi_stop 都执行，忽略未初始化时的返回错误。
+  WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
 
-  // 省电优化：降低 CPU 频率，减少基础功耗。
+  // 降低 CPU 频率。
   setCpuFrequencyMhz(kCpuFrequencyMhz);
 }
 
 void applyPowerSavingConfigAfterBleBegin() {
-  // 省电优化：BLE HID 已启动后再设置 NimBLE 发射功率。
-  // 低发射功率可降低无线部分耗电，但会缩短有效距离。
-  NimBLEDevice::setPower(kBleTxPower);
+  // NimBLE 当前 API 使用 dBm 数值。-3 dBm 适合近距离桌面遥控。
+  // 若连接不稳，改成 0 或 3。
+  NimBLEDevice::setPower(kBleTxPowerDbm);
 }
 
 uint16_t getLoopDelayMs(bool connected) {
   if (screenOff) {
-    return kLoopDelayScreenOffMs;
+    return connected ? kLoopDelayScreenOffConnectedMs : kLoopDelayScreenOffDisconnectedMs;
   }
-
   return connected ? kLoopDelayConnectedMs : kLoopDelayDisconnectedMs;
+}
+
+unsigned long getBatteryPollIntervalMs() {
+  return screenOff ? kBatteryPollScreenOffMs : kBatteryPollAwakeMs;
+}
+
+void pushBleBatteryLevel() {
+  if (batteryLevel < 0) return;
+
+  uint8_t level = (uint8_t)constrain((int)batteryLevel, 0, 100);
+  bleKeyboard.setBatteryLevel(level);
 }
 
 void updatePeerAddress() {
@@ -189,9 +179,18 @@ bool refreshBatteryStatus() {
   int8_t chg = M5Cardputer.Power.isCharging();
   bool charging = (chg == 1);
 
+  if (level >= 0) {
+    level = constrain((int)level, 0, 100);
+  }
+
   bool changed = (level != batteryLevel) || (charging != batteryCharging);
   batteryLevel = level;
   batteryCharging = charging;
+
+  if (changed) {
+    pushBleBatteryLevel();
+  }
+
   return changed;
 }
 
@@ -204,7 +203,6 @@ void drawBatteryIcon(int xRight, int y, int level, bool charging) {
 
   lcd.drawRect(x, y, w, h, frameColor);
   lcd.fillRect(x + w, y + (h - nub) / 2, 2, nub, frameColor);
-
   lcd.fillRect(x + 2, y + 2, w - 4, h - 4, BLACK);
 
   if (level < 0) {
@@ -239,22 +237,25 @@ void drawBatteryIcon(int xRight, int y, int level, bool charging) {
 }
 
 void wakeScreen() {
-  if (screenOff) {
-    screenOff = false;
+  if (!screenOff) return;
 
-    // 省电优化：熄屏时只关闭背光，唤醒时恢复到较低亮度。
-    // 这样比重启屏幕控制器更稳，不影响原有 UI 显示逻辑。
-    M5Cardputer.Display.setBrightness(kScreenBrightness);
+  screenOff = false;
+
+  if (kUseDisplaySleep) {
+    M5Cardputer.Display.wakeup();
   }
+
+  M5Cardputer.Display.setBrightness(currentBrightness());
 }
 
 void turnScreenOff() {
-  if (!screenOff) {
-    screenOff = true;
+  if (screenOff) return;
 
-    // 省电优化：关闭背光是 Cardputer 上最直接、最稳定的省电方式。
-    // 不调用 Display.sleep()，避免部分库版本下唤醒后花屏或需要重绘初始化。
-    M5Cardputer.Display.setBrightness(0);
+  screenOff = true;
+  M5Cardputer.Display.setBrightness(0);
+
+  if (kUseDisplaySleep) {
+    M5Cardputer.Display.sleep();
   }
 }
 
@@ -279,7 +280,7 @@ void drawStatusPage() {
   lcd.print(connected ? "蓝牙: 已连接" : "蓝牙: 等待PC连接...");
 
   lcd.setTextColor(0xC618, BLACK);
-  char battText[20];
+  char battText[24];
   if (batteryLevel < 0) {
     snprintf(battText, sizeof(battText), "电量: --");
   } else {
@@ -309,10 +310,22 @@ void drawStatusPage() {
              autoSleepEnabled ? "开" : "关",
              kSleepPresetsSec[sleepPresetIndex]);
 
+  y += 17;
+
+  lcd.setCursor(4, y);
+  lcd.printf("亮度: %u / 100", currentBrightness());
+
   y += 20;
 
   lcd.drawFastHLine(0, y, lcd.width(), 0x39C7);
   y += 6;
+
+  if (batteryLevel >= 0 && batteryLevel <= 15 && !batteryCharging) {
+    lcd.setTextColor(RED, BLACK);
+    lcd.setCursor(4, y);
+    lcd.print("低电量，请尽快充电");
+    y += 16;
+  }
 
   lcd.setTextColor(YELLOW, BLACK);
   lcd.setCursor(4, y);
@@ -320,7 +333,7 @@ void drawStatusPage() {
 
   lcd.setTextColor(0x7BEF, BLACK);
   lcd.setCursor(4, lcd.height() - 16);
-  lcd.print("Fn+/ 查看按键说明");
+  lcd.print("Fn+/ 说明  Fn+L 亮度");
 }
 
 void drawLegendPage() {
@@ -340,32 +353,29 @@ void drawLegendPage() {
   lcd.setFont(&fonts::efontCN_12);
   lcd.setTextColor(0xC618, BLACK);
 
-  const char* rows[6][2] = {
+  const char* rows[7][2] = {
     {"C 连接", "X 断开"},
     {"1 音量-", "2 音量+"},
     {"M 静音", "I 输入"},
     {"O 输出", "P 播放暂停"},
     {"N 下一曲", "B 上一曲"},
     {"Fn+S 熄屏开关", "Fn+,/. 熄屏时长"},
+    {"Fn+L 亮度档位", "Fn+/ 页面切换"},
   };
 
-  for (int row = 0; row < 6; row++) {
+  for (int row = 0; row < 7; row++) {
     lcd.setCursor(colX[0], y);
     lcd.print(rows[row][0]);
 
     lcd.setCursor(colX[1], y);
     lcd.print(rows[row][1]);
 
-    y += 17;
+    y += 15;
   }
 }
 
 void drawUI() {
-  // 省电优化：屏幕熄灭时不主动重绘，避免无意义 SPI 刷屏。
-  // 需要显示时会先 wakeScreen()，再 drawUI()。
-  if (screenOff) {
-    return;
-  }
+  if (screenOff) return;
 
   auto &lcd = M5Cardputer.Display;
 
@@ -436,10 +446,12 @@ bool handleMediaKey(char c) {
 }
 
 bool handleSettingsKey(char c) {
-  if (c == 's' || c == 'S') {
-    autoSleepEnabled = !autoSleepEnabled;
+  if (c >= 'A' && c <= 'Z') {
+    c = c - 'A' + 'a';
+  }
 
-    // 省电说明：NVS 写入只在用户切换设置时发生，频率很低，保留原逻辑。
+  if (c == 's') {
+    autoSleepEnabled = !autoSleepEnabled;
     prefs.putBool("autoSleep", autoSleepEnabled);
 
     lastActionText = autoSleepEnabled ? "自动熄屏: 开" : "自动熄屏: 关";
@@ -470,18 +482,24 @@ bool handleSettingsKey(char c) {
     return true;
   }
 
+  if (c == 'l') {
+    brightnessPresetIndex = (brightnessPresetIndex + 1) % kBrightnessPresetCount;
+    prefs.putUChar("brightIdx", brightnessPresetIndex);
+
+    if (!screenOff) {
+      M5Cardputer.Display.setBrightness(currentBrightness());
+    }
+
+    lastActionText = String("屏幕亮度: ") + currentBrightness();
+    return true;
+  }
+
   return false;
 }
 
 /*
   Cardputer-Adv / newer M5Cardputer Fn-layer fix:
-
-  不再依赖 status.word 判断 Fn+/、Fn+,、Fn+.。
-  因为 Fn 层可能把这些键转换成方向键或其他逻辑键，
-  导致 status.word 里没有原始字符 '/'、','、'.'。
-
-  这里直接用 isKeyPressed(KEY_FN) + isKeyPressed('<physical key>')
-  判断当前物理按键组合。
+  不依赖 status.word 判断 Fn+/、Fn+,、Fn+.。
 */
 bool handleFnSettingsPhysical() {
   if (!M5Cardputer.Keyboard.isKeyPressed(KEY_FN)) {
@@ -505,33 +523,54 @@ bool handleFnSettingsPhysical() {
     return handleSettingsKey('/');
   }
 
+  if (M5Cardputer.Keyboard.isKeyPressed('l') ||
+      M5Cardputer.Keyboard.isKeyPressed('L')) {
+    return handleSettingsKey('l');
+  }
+
   return false;
 }
 
 void setup() {
   auto cfg = M5.config();
 
+  // 省电：不用的内部硬件直接不初始化。
+  cfg.internal_spk = false;
+  cfg.internal_mic = false;
+  cfg.internal_imu = false;
+  cfg.external_speaker_value = 0;
+  cfg.external_display_value = 0;
+  cfg.led_brightness = 0;
+
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Display.setRotation(1);
-  M5Cardputer.Display.setBrightness(kScreenBrightness);
-
-  // 省电优化：M5 初始化完成后、BLE 启动前，关闭 WiFi 并降低 CPU 频率。
-  applyPowerSavingConfigBeforeBle();
 
   prefs.begin("dx1remote", false);
   autoSleepEnabled = prefs.getBool("autoSleep", true);
   sleepPresetIndex = prefs.getUChar("sleepIdx", 1);
+  brightnessPresetIndex = prefs.getUChar("brightIdx", 1);
 
   if (sleepPresetIndex >= kSleepPresetCount) {
     sleepPresetIndex = 1;
   }
 
-  bleKeyboard.begin();
+  if (brightnessPresetIndex >= kBrightnessPresetCount) {
+    brightnessPresetIndex = 1;
+  }
 
-  // 省电优化：BLE HID 启动后降低 BLE 发射功率。
+  M5Cardputer.Display.setBrightness(currentBrightness());
+
+  // 双保险：即使库内部默认初始化过，也主动关闭不用的音频任务。
+  M5Cardputer.Speaker.end();
+  M5Cardputer.Mic.end();
+
+  applyPowerSavingConfigBeforeBle();
+
+  bleKeyboard.begin();
   applyPowerSavingConfigAfterBleBegin();
 
   refreshBatteryStatus();
+  pushBleBatteryLevel();
   lastBatteryPollMs = millis();
 
   lastActivityMs = millis();
@@ -548,8 +587,10 @@ void loop() {
     lastConnectedState = connected;
 
     if (connected) {
-      delay(200);
+      delay(150);
+      applyPowerSavingConfigAfterBleBegin();
       updatePeerAddress();
+      pushBleBatteryLevel();
       lastActionText = "蓝牙已连接";
     } else {
       peerAddressText = "";
@@ -561,8 +602,8 @@ void loop() {
     drawUI();
   }
 
-  // 省电优化：电量低频轮询；电量变化不会唤醒屏幕。
-  if (now - lastBatteryPollMs > kBatteryPollIntervalMs) {
+  // 电量低频轮询；变化会同步 BLE HID 电池服务，但不会主动唤醒屏幕。
+  if (now - lastBatteryPollMs >= getBatteryPollIntervalMs()) {
     lastBatteryPollMs = now;
 
     if (refreshBatteryStatus() && !screenOff) {
@@ -573,6 +614,11 @@ void loop() {
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     bool handled = false;
+    bool wasScreenOff = screenOff;
+
+    // 任意按键先唤醒屏幕并刷新活动时间；无效键不发送蓝牙。
+    wakeScreen();
+    lastActivityMs = millis();
 
     if (M5Cardputer.Keyboard.isKeyPressed(KEY_FN) || status.fn) {
       handled = handleFnSettingsPhysical();
@@ -580,17 +626,18 @@ void loop() {
       for (auto c : status.word) {
         if (handleDx1Key(c)) {
           handled = true;
+          continue;
         }
 
         if (handleMediaKey(c)) {
           handled = true;
+          continue;
         }
       }
     }
 
-    if (handled) {
-      wakeScreen();
-      lastActivityMs = millis();
+    // 熄屏状态下任意键唤醒后需要重绘；正常亮屏时只有处理过的键才重绘。
+    if (handled || wasScreenOff) {
       drawUI();
     }
   }
@@ -598,12 +645,10 @@ void loop() {
   if (autoSleepEnabled && !screenOff) {
     unsigned long timeoutMs = (unsigned long)kSleepPresetsSec[sleepPresetIndex] * 1000UL;
 
-    if (millis() - lastActivityMs > timeoutMs) {
+    if (millis() - lastActivityMs >= timeoutMs) {
       turnScreenOff();
     }
   }
 
-  // 省电优化：原来固定 delay(5)。
-  // 现在按状态自适应延时，减少空转耗电，同时仍保持 TCA8418 键盘 FIFO 不易溢出。
   delay(getLoopDelayMs(connected));
 }
