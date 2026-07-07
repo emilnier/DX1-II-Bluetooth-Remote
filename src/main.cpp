@@ -13,8 +13,6 @@
   8. Wake screen on any key press, but only redraw when needed.
 */
 
-
-
 #include <M5Cardputer.h>
 
 // --- 在引入 BleKeyboard 之前，取消所有冲突的宏定义 ---
@@ -122,6 +120,14 @@ static const uint16_t kLoopDelayConnectedMs = 8;
 static const uint16_t kLoopDelayDisconnectedMs = 15;
 static const uint16_t kLoopDelayScreenOffConnectedMs = 18;
 static const uint16_t kLoopDelayScreenOffDisconnectedMs = 30;
+
+// ---------- 音量长按连续调节相关变量 ----------
+static bool volDownHeld = false;
+static bool volUpHeld = false;
+static unsigned long lastVolDownMs = 0;
+static unsigned long lastVolUpMs = 0;
+static const unsigned long kVolRepeatIntervalMs = 400; // 重复发送间隔 ms
+// --------------------------------------------
 
 uint8_t currentBrightness() {
   if (brightnessPresetIndex >= kBrightnessPresetCount) {
@@ -583,6 +589,32 @@ void loop() {
   unsigned long now = millis();
   bool connected = bleKeyboard.isConnected();
 
+  // ---------- 长按音量键连续调节 ----------
+  // 检测音量键是否被按住，实现连续发送组合键
+  bool volDownNow = M5Cardputer.Keyboard.isKeyPressed('1');
+  bool volUpNow = M5Cardputer.Keyboard.isKeyPressed('2');
+
+  if (volDownNow) {
+    if (volDownHeld && bleKeyboard.isConnected() && (now - lastVolDownMs >= kVolRepeatIntervalMs)) {
+      sendComboKey('1');
+      lastVolDownMs = now;
+      lastActivityMs = now;  // 长按期间保持屏幕唤醒，避免自动熄屏
+    }
+  } else {
+    volDownHeld = false;
+  }
+
+  if (volUpNow) {
+    if (volUpHeld && bleKeyboard.isConnected() && (now - lastVolUpMs >= kVolRepeatIntervalMs)) {
+      sendComboKey('2');
+      lastVolUpMs = now;
+      lastActivityMs = now;
+    }
+  } else {
+    volUpHeld = false;
+  }
+  // ---------------------------------------
+
   if (connected != lastConnectedState) {
     lastConnectedState = connected;
 
@@ -626,6 +658,16 @@ void loop() {
       for (auto c : status.word) {
         if (handleDx1Key(c)) {
           handled = true;
+
+          // 记录音量键长按状态，首次按下后启动连续发送计时
+          if (c == '1') {
+            volDownHeld = true;
+            lastVolDownMs = now;
+          } else if (c == '2') {
+            volUpHeld = true;
+            lastVolUpMs = now;
+          }
+
           continue;
         }
 
