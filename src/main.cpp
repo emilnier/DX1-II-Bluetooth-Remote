@@ -1,21 +1,41 @@
 /*
   DX1 II Bluetooth Remote for M5Stack Cardputer-Adv
-  Power-optimized revision
+  =================================================
 
-  Main changes:
-  1. Force ESP32-BLE-Keyboard to use NimBLE mode.
-  2. Fix BLE TX power setting: use dBm value for NimBLEDevice::setPower().
-  3. Disable unused M5 internal peripherals: speaker, mic, IMU.
-  4. Keep WiFi fully off.
-  5. Lower default brightness and add Fn+L brightness presets.
-  6. Report real battery level to BLE HID Battery Service.
-  7. Use longer battery polling while screen is off.
-  8. Wake screen on any key press, but only redraw when needed.
+  Goals of this revision:
+  - Low idle power without sacrificing BLE keyboard reliability.
+  - No blocking delay in HID key transmission.
+  - Bounded memory usage; avoid long-lived Arduino String fragmentation.
+  - Debounced NVS writes to reduce flash wear.
+  - Coalesced display refreshes to reduce SPI traffic and flicker.
+  - Useful local settings and diagnostics.
+
+  PC bridge hotkeys (Ctrl+Alt+key):
+    C/X       connect/disconnect DX1 II
+    1/2       volume down/up (supports accelerated hold repeat)
+    3         cycle volume presets
+    0/R       safe volume / restore prior volume
+    M         mute toggle
+    I         input toggle
+    O         output cycle
+    U/T       USB / optical input directly
+    7/8/9     headphone / line-out / all outputs directly
+
+  System media keys:
+    P/N/B     play-pause / next / previous
+
+  Local Fn settings:
+    Fn+S      auto screen-off on/off
+    Fn+,/.    shorter/longer screen timeout
+    Fn+L      brightness preset
+    Fn+E      eco/responsive mode
+    Fn+W      wake-only first key on/off
+    Fn+/      page switch
 */
 
 #include <M5Cardputer.h>
 
-// --- 在引入 BleKeyboard 之前，取消所有冲突的宏定义 ---
+// M5Cardputer and ESP32-BLE-Keyboard expose some overlapping key macros.
 #undef KEY_LEFT_CTRL
 #undef KEY_LEFT_SHIFT
 #undef KEY_LEFT_ALT
@@ -36,13 +56,20 @@
 #undef KEY_F12
 
 #include <BleKeyboard.h>
-#include <Preferences.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <stdarg.h>
 
 BleKeyboard bleKeyboard("DX1II Remote", "M5Stack", 100);
 Preferences prefs;
+
+namespace {
+
+// -----------------------------------------------------------------------------
+// Static configuration
+// -----------------------------------------------------------------------------
 
 struct KeyAction {
   char key;
@@ -56,156 +83,316 @@ struct MediaAction {
   const char* label;
 };
 
-// Keep these in sync with dx1_bridge's HOTKEY_ACTIONS map.
-static const KeyAction kActions[] = {
-  {'c', 'c', "连接"},
-  {'x', 'x', "断开"},
-  {'1', '1', "音量-"},
-  {'2', '2', "音量+"},
-  {'m', 'm', "静音切换"},
-  {'i', 'i', "输入切换"},
-  {'o', 'o', "输出切换"},
+// Keep this map synchronized with server.js HOTKEY_ACTIONS.
+constexpr KeyAction kActions[] = {
+    {'c', 'c', "连接"},       {'x', 'x', "断开"},
+    {'1', '1', "音量-"},      {'2', '2', "音量+"},
+    {'3', '3', "音量预设"},   {'0', '0', "安全音量"},
+    {'r', 'r', "恢复音量"},   {'m', 'm', "静音切换"},
+    {'i', 'i', "输入切换"},   {'o', 'o', "输出切换"},
+    {'u', 'u', "USB输入"},    {'t', 't', "光纤输入"},
+    {'7', '7', "耳放输出"},   {'8', '8', "LO输出"},
+    {'9', '9', "全部输出"},
 };
-static const size_t kActionCount = sizeof(kActions) / sizeof(kActions[0]);
+constexpr size_t kActionCount = sizeof(kActions) / sizeof(kActions[0]);
 
-static const MediaAction kMediaActions[] = {
-  {'p', KEY_MEDIA_PLAY_PAUSE, "播放/暂停"},
-  {'n', KEY_MEDIA_NEXT_TRACK, "下一曲"},
-  {'b', KEY_MEDIA_PREVIOUS_TRACK, "上一曲"},
+constexpr MediaAction kMediaActions[] = {
+    {'p', KEY_MEDIA_PLAY_PAUSE, "播放/暂停"},
+    {'n', KEY_MEDIA_NEXT_TRACK, "下一曲"},
+    {'b', KEY_MEDIA_PREVIOUS_TRACK, "上一曲"},
 };
-static const size_t kMediaActionCount = sizeof(kMediaActions) / sizeof(kMediaActions[0]);
+constexpr size_t kMediaActionCount = sizeof(kMediaActions) / sizeof(kMediaActions[0]);
 
-// Auto screen-off timeout presets, in seconds. Cycle with Fn+, / Fn+.
-static const uint16_t kSleepPresetsSec[] = {10, 30, 60, 120, 300};
-static const size_t kSleepPresetCount = sizeof(kSleepPresetsSec) / sizeof(kSleepPresetsSec[0]);
+constexpr uint16_t kSleepPresetsSec[] = {10, 30, 60, 120, 300, 600};
+constexpr size_t kSleepPresetCount = sizeof(kSleepPresetsSec) / sizeof(kSleepPresetsSec[0]);
 
-// 新增：亮度档位。默认使用 45，续航优先；需要更亮可 Fn+L 切换。
-static const uint8_t kBrightnessPresets[] = {25, 45, 70, 100};
-static const size_t kBrightnessPresetCount = sizeof(kBrightnessPresets) / sizeof(kBrightnessPresets[0]);
+constexpr uint8_t kBrightnessPresets[] = {18, 32, 50, 75, 100};
+constexpr size_t kBrightnessPresetCount = sizeof(kBrightnessPresets) / sizeof(kBrightnessPresets[0]);
 
-static bool autoSleepEnabled = true;
-static uint8_t sleepPresetIndex = 1;
-static uint8_t brightnessPresetIndex = 1;
-static bool screenOff = false;
-static unsigned long lastActivityMs = 0;
+constexpr bool kUseDisplayControllerSleep = false;
+constexpr uint32_t kBatteryPollAwakeMs = 30000;
+constexpr uint32_t kBatteryPollScreenOffMs = 120000;
+constexpr uint32_t kSettingsWriteDelayMs = 2500;
+constexpr uint32_t kUiMinRedrawIntervalMs = 30;
+constexpr uint32_t kPeerAddressDelayMs = 250;
 
-// 如果你实测 Display.sleep()/wakeup() 稳定，可改成 true 进一步降低屏幕控制器功耗。
-// 默认 false：只关背光，稳定性最好。
-static const bool kUseDisplaySleep = false;
+constexpr uint16_t kComboHoldMs = 14;
+constexpr uint16_t kInterHidEventGapMs = 8;
+constexpr size_t kHidQueueCapacity = 16;
 
-// 0 = status page, 1 = key legend page
-static uint8_t currentPage = 0;
+constexpr uint32_t kVolumeRepeatInitialDelayMs = 450;
+constexpr uint32_t kVolumeRepeatNormalMs = 180;
+constexpr uint32_t kVolumeRepeatFastAfterMs = 2200;
+constexpr uint32_t kVolumeRepeatFastMs = 90;
 
-static String lastActionText = "等待按键...";
-static bool lastConnectedState = false;
-static String peerAddressText = "";
+// BLE advertising units are 0.625 ms. 160..240 = 100..150 ms.
+constexpr uint16_t kAdvertisingMinInterval = 160;
+constexpr uint16_t kAdvertisingMaxInterval = 240;
 
-// ESP32-S3 降频到 80 MHz。继续降低到 40 MHz 可能影响 BLE/I2C/SPI 响应。
-static const uint32_t kCpuFrequencyMhz = 80;
+constexpr uint32_t kEcoCpuMhz = 80;
+constexpr uint32_t kResponsiveCpuMhz = 160;
+constexpr esp_power_level_t kEcoBleTxPower = ESP_PWR_LVL_N3;   // -3 dBm
+constexpr esp_power_level_t kResponsiveBleTxPower = ESP_PWR_LVL_P3;  // +3 dBm
 
-// NimBLEDevice::setPower() 严格要求传入 esp_power_level_t 枚举类型，而不是普通的 int8_t 整数
-static const esp_power_level_t kBleTxPowerDbm = ESP_PWR_LVL_P3;
+// -----------------------------------------------------------------------------
+// Runtime state
+// -----------------------------------------------------------------------------
 
-// Battery state
-static int32_t batteryLevel = -1;
-static bool batteryCharging = false;
-static unsigned long lastBatteryPollMs = 0;
+bool autoSleepEnabled = true;
+uint8_t sleepPresetIndex = 1;
+uint8_t brightnessPresetIndex = 1;
+bool ecoModeEnabled = true;
+bool wakeOnlyFirstKey = false;
 
-// 亮屏时 30 秒；熄屏时 120 秒。熄屏时电量显示不可见，没有必要频繁读取。
-static const unsigned long kBatteryPollAwakeMs = 30000;
-static const unsigned long kBatteryPollScreenOffMs = 120000;
+bool screenOff = false;
+uint8_t currentPage = 0;
+uint32_t lastActivityMs = 0;
 
-// 自适应 loop 延时。熄屏时适当放慢，但不要太大，避免键盘 FIFO 在连续按键时堆积。
-static const uint16_t kLoopDelayConnectedMs = 8;
-static const uint16_t kLoopDelayDisconnectedMs = 15;
-static const uint16_t kLoopDelayScreenOffConnectedMs = 18;
-static const uint16_t kLoopDelayScreenOffDisconnectedMs = 30;
+char lastActionText[96] = "等待按键...";
+char peerAddressText[40] = "-";
+bool lastConnectedState = false;
+bool peerRefreshPending = false;
+uint32_t peerRefreshDueMs = 0;
 
-// ---------- 音量长按连续调节相关变量 ----------
-static bool volDownHeld = false;
-static bool volUpHeld = false;
-static unsigned long lastVolDownMs = 0;
-static unsigned long lastVolUpMs = 0;
-static const unsigned long kVolRepeatIntervalMs = 400; // 重复发送间隔 ms
-// --------------------------------------------
+int32_t batteryLevel = -1;
+bool batteryCharging = false;
+uint32_t lastBatteryPollMs = 0;
+
+bool settingsDirty = false;
+uint32_t settingsDirtySinceMs = 0;
+
+bool uiDirty = true;
+uint32_t lastUiDrawMs = 0;
+
+bool volDownHeld = false;
+bool volUpHeld = false;
+uint32_t volDownHoldStartMs = 0;
+uint32_t volUpHoldStartMs = 0;
+uint32_t lastVolDownRepeatMs = 0;
+uint32_t lastVolUpRepeatMs = 0;
+
+// -----------------------------------------------------------------------------
+// Small helpers
+// -----------------------------------------------------------------------------
+
+bool timeReached(uint32_t now, uint32_t deadline) {
+  return static_cast<int32_t>(now - deadline) >= 0;
+}
+
+char normalizeKey(char c) {
+  if (c >= 'A' && c <= 'Z') return static_cast<char>(c - 'A' + 'a');
+  return c;
+}
+
+void setLastAction(const char* text) {
+  snprintf(lastActionText, sizeof(lastActionText), "%s", text ? text : "");
+  uiDirty = true;
+}
+
+void setLastActionf(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  vsnprintf(lastActionText, sizeof(lastActionText), format, args);
+  va_end(args);
+  uiDirty = true;
+}
 
 uint8_t currentBrightness() {
-  if (brightnessPresetIndex >= kBrightnessPresetCount) {
-    brightnessPresetIndex = 1;
-  }
+  if (brightnessPresetIndex >= kBrightnessPresetCount) brightnessPresetIndex = 1;
   return kBrightnessPresets[brightnessPresetIndex];
 }
 
-void applyPowerSavingConfigBeforeBle() {
-  // 本固件不使用 WiFi。disconnect + WIFI_OFF + esp_wifi_stop 都执行，忽略未初始化时的返回错误。
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  esp_wifi_stop();
-
-  // 降低 CPU 频率。
-  setCpuFrequencyMhz(kCpuFrequencyMhz);
-}
-
-void applyPowerSavingConfigAfterBleBegin() {
-  // NimBLE 当前 API 使用 dBm 数值。-3 dBm 适合近距离桌面遥控。
-  // 若连接不稳，改成 0 或 3。
-  NimBLEDevice::setPower(kBleTxPowerDbm);
-}
-
-uint16_t getLoopDelayMs(bool connected) {
-  if (screenOff) {
-    return connected ? kLoopDelayScreenOffConnectedMs : kLoopDelayScreenOffDisconnectedMs;
+uint8_t effectiveBrightness() {
+  uint8_t brightness = currentBrightness();
+  // A gentle emergency dim preserves usability while extending the final minutes.
+  if (!batteryCharging && batteryLevel >= 0 && batteryLevel <= 10) {
+    brightness = brightness < 18 ? brightness : 18;
   }
-  return connected ? kLoopDelayConnectedMs : kLoopDelayDisconnectedMs;
+  return brightness;
 }
 
-unsigned long getBatteryPollIntervalMs() {
+uint32_t batteryPollIntervalMs() {
   return screenOff ? kBatteryPollScreenOffMs : kBatteryPollAwakeMs;
 }
 
-void pushBleBatteryLevel() {
-  if (batteryLevel < 0) return;
-
-  uint8_t level = (uint8_t)constrain((int)batteryLevel, 0, 100);
-  bleKeyboard.setBatteryLevel(level);
+void markSettingsDirty(uint32_t now) {
+  settingsDirty = true;
+  settingsDirtySinceMs = now;
 }
 
-void updatePeerAddress() {
-  peerAddressText = "";
+void applyDisplayBrightness() {
+  if (!screenOff) M5Cardputer.Display.setBrightness(effectiveBrightness());
+}
 
-  NimBLEServer* server = NimBLEDevice::getServer();
-  if (!server || server->getConnectedCount() == 0) return;
+void applyOperatingMode() {
+  setCpuFrequencyMhz(ecoModeEnabled ? kEcoCpuMhz : kResponsiveCpuMhz);
+  NimBLEDevice::setPower(ecoModeEnabled ? kEcoBleTxPower : kResponsiveBleTxPower);
+}
 
-  NimBLEConnInfo info = server->getPeerInfo(0);
-  peerAddressText = String(info.getAddress().toString().c_str());
+void configureAdvertisingForBatteryLife() {
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  if (!advertising) return;
+  advertising->setMinInterval(kAdvertisingMinInterval);
+  advertising->setMaxInterval(kAdvertisingMaxInterval);
+}
+
+void applyPowerSavingConfigBeforeBle() {
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+  setCpuFrequencyMhz(ecoModeEnabled ? kEcoCpuMhz : kResponsiveCpuMhz);
+}
+
+// -----------------------------------------------------------------------------
+// Non-blocking HID transmission queue
+// -----------------------------------------------------------------------------
+
+enum class HidEventType : uint8_t { Combo, Media };
+
+struct HidEvent {
+  HidEventType type;
+  char comboKey;
+  const uint8_t* mediaKey;
+};
+
+HidEvent hidQueue[kHidQueueCapacity];
+size_t hidQueueHead = 0;
+size_t hidQueueTail = 0;
+size_t hidQueueCount = 0;
+
+enum class HidTxPhase : uint8_t { Idle, ComboReleasePending };
+HidTxPhase hidTxPhase = HidTxPhase::Idle;
+uint32_t hidTxDeadlineMs = 0;
+uint32_t nextHidStartMs = 0;
+
+bool enqueueHidEvent(const HidEvent& event) {
+  if (hidQueueCount >= kHidQueueCapacity) {
+    setLastAction("发送队列已满，请稍后重试");
+    return false;
+  }
+  hidQueue[hidQueueTail] = event;
+  hidQueueTail = (hidQueueTail + 1) % kHidQueueCapacity;
+  ++hidQueueCount;
+  return true;
+}
+
+bool dequeueHidEvent(HidEvent& event) {
+  if (hidQueueCount == 0) return false;
+  event = hidQueue[hidQueueHead];
+  hidQueueHead = (hidQueueHead + 1) % kHidQueueCapacity;
+  --hidQueueCount;
+  return true;
+}
+
+void clearHidQueue() {
+  hidQueueHead = 0;
+  hidQueueTail = 0;
+  hidQueueCount = 0;
+  hidTxPhase = HidTxPhase::Idle;
+  hidTxDeadlineMs = 0;
+  nextHidStartMs = 0;
+}
+
+void serviceHidTx(uint32_t now, bool connected) {
+  if (!connected) {
+    if (hidTxPhase == HidTxPhase::ComboReleasePending) bleKeyboard.releaseAll();
+    clearHidQueue();
+    return;
+  }
+
+  if (hidTxPhase == HidTxPhase::ComboReleasePending) {
+    if (!timeReached(now, hidTxDeadlineMs)) return;
+    bleKeyboard.releaseAll();
+    hidTxPhase = HidTxPhase::Idle;
+    nextHidStartMs = now + kInterHidEventGapMs;
+  }
+
+  if (hidTxPhase != HidTxPhase::Idle || !timeReached(now, nextHidStartMs)) return;
+
+  HidEvent event{};
+  if (!dequeueHidEvent(event)) return;
+
+  if (event.type == HidEventType::Combo) {
+    bleKeyboard.press(KEY_LEFT_CTRL);
+    bleKeyboard.press(KEY_LEFT_ALT);
+    bleKeyboard.press(event.comboKey);
+    hidTxPhase = HidTxPhase::ComboReleasePending;
+    hidTxDeadlineMs = now + kComboHoldMs;
+  } else if (event.mediaKey) {
+    bleKeyboard.write(event.mediaKey);
+    nextHidStartMs = now + kInterHidEventGapMs;
+  }
+}
+
+bool enqueueCombo(char key) {
+  return enqueueHidEvent({HidEventType::Combo, key, nullptr});
+}
+
+bool enqueueMedia(const uint8_t* mediaKey) {
+  return enqueueHidEvent({HidEventType::Media, 0, mediaKey});
+}
+
+// -----------------------------------------------------------------------------
+// Battery and BLE status
+// -----------------------------------------------------------------------------
+
+void pushBleBatteryLevel() {
+  if (batteryLevel < 0) return;
+  bleKeyboard.setBatteryLevel(static_cast<uint8_t>(constrain(static_cast<int>(batteryLevel), 0, 100)));
 }
 
 bool refreshBatteryStatus() {
   int32_t level = M5Cardputer.Power.getBatteryLevel();
-  int8_t chg = M5Cardputer.Power.isCharging();
-  bool charging = (chg == 1);
+  const bool charging = (M5Cardputer.Power.isCharging() == 1);
+  if (level >= 0) level = constrain(static_cast<int>(level), 0, 100);
 
-  if (level >= 0) {
-    level = constrain((int)level, 0, 100);
-  }
-
-  bool changed = (level != batteryLevel) || (charging != batteryCharging);
+  const bool changed = (level != batteryLevel) || (charging != batteryCharging);
   batteryLevel = level;
   batteryCharging = charging;
 
   if (changed) {
     pushBleBatteryLevel();
+    applyDisplayBrightness();
+    uiDirty = true;
   }
-
   return changed;
 }
 
-void drawBatteryIcon(int xRight, int y, int level, bool charging) {
-  auto &lcd = M5Cardputer.Display;
-  const int w = 22, h = 11, nub = 4;
-  const int x = xRight - w - 3;
+void updatePeerAddress() {
+  snprintf(peerAddressText, sizeof(peerAddressText), "-");
+  NimBLEServer* server = NimBLEDevice::getServer();
+  if (!server || server->getConnectedCount() == 0) return;
 
-  const uint16_t frameColor = 0xC618;
+  const NimBLEConnInfo info = server->getPeerInfo(0);
+  snprintf(peerAddressText, sizeof(peerAddressText), "%s", const_cast<NimBLEConnInfo&>(info).getAddress().toString().c_str());
+}
+
+// -----------------------------------------------------------------------------
+// Display
+// -----------------------------------------------------------------------------
+
+void wakeScreen() {
+  if (!screenOff) return;
+  screenOff = false;
+  if (kUseDisplayControllerSleep) M5Cardputer.Display.wakeup();
+  M5Cardputer.Display.setBrightness(effectiveBrightness());
+  uiDirty = true;
+}
+
+void turnScreenOff() {
+  if (screenOff) return;
+  screenOff = true;
+  M5Cardputer.Display.setBrightness(0);
+  if (kUseDisplayControllerSleep) M5Cardputer.Display.sleep();
+}
+
+void drawBatteryIcon(int xRight, int y, int level, bool charging) {
+  auto& lcd = M5Cardputer.Display;
+  constexpr int w = 22;
+  constexpr int h = 11;
+  constexpr int nub = 4;
+  const int x = xRight - w - 3;
+  constexpr uint16_t frameColor = 0xC618;
 
   lcd.drawRect(x, y, w, h, frameColor);
   lcd.fillRect(x + w, y + (h - nub) / 2, 2, nub, frameColor);
@@ -219,20 +406,9 @@ void drawBatteryIcon(int xRight, int y, int level, bool charging) {
     return;
   }
 
-  uint16_t fillColor;
-  if (level <= 15) {
-    fillColor = RED;
-  } else if (level <= 40) {
-    fillColor = YELLOW;
-  } else {
-    fillColor = GREEN;
-  }
-
-  int innerW = w - 4;
-  int fillW = (innerW * level) / 100;
-  if (fillW > 0) {
-    lcd.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
-  }
+  const uint16_t fillColor = level <= 15 ? RED : (level <= 40 ? YELLOW : GREEN);
+  const int fillW = ((w - 4) * level) / 100;
+  if (fillW > 0) lcd.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
 
   if (charging) {
     lcd.setFont(&fonts::efontCN_12);
@@ -242,305 +418,346 @@ void drawBatteryIcon(int xRight, int y, int level, bool charging) {
   }
 }
 
-void wakeScreen() {
-  if (!screenOff) return;
-
-  screenOff = false;
-
-  if (kUseDisplaySleep) {
-    M5Cardputer.Display.wakeup();
-  }
-
-  M5Cardputer.Display.setBrightness(currentBrightness());
-}
-
-void turnScreenOff() {
-  if (screenOff) return;
-
-  screenOff = true;
-  M5Cardputer.Display.setBrightness(0);
-
-  if (kUseDisplaySleep) {
-    M5Cardputer.Display.sleep();
-  }
-}
-
 void drawStatusPage() {
-  auto &lcd = M5Cardputer.Display;
+  auto& lcd = M5Cardputer.Display;
   int y = 2;
 
   lcd.setFont(&fonts::efontCN_16);
   lcd.setTextColor(WHITE, BLACK);
   lcd.setCursor(4, y);
   lcd.print("DX1 II 蓝牙遥控");
-
   drawBatteryIcon(lcd.width() - 4, y + 2, batteryLevel, batteryCharging);
 
   y += 20;
-
   lcd.setFont(&fonts::efontCN_14);
-  bool connected = bleKeyboard.isConnected();
-
+  const bool connected = bleKeyboard.isConnected();
   lcd.setTextColor(connected ? GREEN : RED, BLACK);
   lcd.setCursor(4, y);
   lcd.print(connected ? "蓝牙: 已连接" : "蓝牙: 等待PC连接...");
 
-  lcd.setTextColor(0xC618, BLACK);
-  char battText[24];
+  char batteryText[32];
   if (batteryLevel < 0) {
-    snprintf(battText, sizeof(battText), "电量: --");
+    snprintf(batteryText, sizeof(batteryText), "电量: --");
   } else {
-    snprintf(battText, sizeof(battText), "电量: %ld%%%s",
-             (long)batteryLevel, batteryCharging ? " 充电中" : "");
+    snprintf(batteryText, sizeof(batteryText), "电量: %ld%%%s", static_cast<long>(batteryLevel),
+             batteryCharging ? " 充电" : "");
   }
-
-  int battTextW = lcd.textWidth(battText);
-  lcd.setCursor(lcd.width() - battTextW - 4, y);
-  lcd.print(battText);
-
-  y += 17;
-
   lcd.setTextColor(0xC618, BLACK);
-  lcd.setCursor(4, y);
-
-  if (connected && peerAddressText.length() > 0) {
-    lcd.print("设备地址: " + peerAddressText);
-  } else {
-    lcd.print("设备地址: -");
-  }
+  lcd.setCursor(lcd.width() - lcd.textWidth(batteryText) - 4, y);
+  lcd.print(batteryText);
 
   y += 17;
-
   lcd.setCursor(4, y);
-  lcd.printf("自动熄屏: %s (%us)",
-             autoSleepEnabled ? "开" : "关",
-             kSleepPresetsSec[sleepPresetIndex]);
+  lcd.printf("设备地址: %s", connected ? peerAddressText : "-");
 
   y += 17;
-
   lcd.setCursor(4, y);
-  lcd.printf("亮度: %u / 100", currentBrightness());
+  lcd.printf("熄屏: %s %us  亮度:%u", autoSleepEnabled ? "开" : "关",
+             kSleepPresetsSec[sleepPresetIndex], currentBrightness());
 
-  y += 20;
+  y += 17;
+  lcd.setCursor(4, y);
+  lcd.printf("模式: %s  唤醒键:%s", ecoModeEnabled ? "省电" : "响应",
+             wakeOnlyFirstKey ? "仅唤醒" : "执行");
 
+  y += 19;
   lcd.drawFastHLine(0, y, lcd.width(), 0x39C7);
-  y += 6;
+  y += 5;
 
-  if (batteryLevel >= 0 && batteryLevel <= 15 && !batteryCharging) {
-    lcd.setTextColor(RED, BLACK);
-    lcd.setCursor(4, y);
-    lcd.print("低电量，请尽快充电");
-    y += 16;
-  }
-
-  lcd.setTextColor(YELLOW, BLACK);
+  const bool lowBattery = batteryLevel >= 0 && batteryLevel <= 10 && !batteryCharging;
+  lcd.setTextColor(lowBattery ? RED : YELLOW, BLACK);
   lcd.setCursor(4, y);
-  lcd.print(lastActionText);
+  lcd.print(lowBattery ? "低电量：背光受限" : lastActionText);
 
+  lcd.setFont(&fonts::efontCN_12);
   lcd.setTextColor(0x7BEF, BLACK);
-  lcd.setCursor(4, lcd.height() - 16);
-  lcd.print("Fn+/ 说明  Fn+L 亮度");
+  lcd.setCursor(4, lcd.height() - 14);
+  lcd.print("Fn+/ 翻页  Fn+E 省电模式");
 }
 
 void drawLegendPage() {
-  auto &lcd = M5Cardputer.Display;
-  const int colX[2] = {4, 128};
+  auto& lcd = M5Cardputer.Display;
+  constexpr int colX[2] = {4, 123};
   int y = 2;
 
   lcd.setFont(&fonts::efontCN_14);
   lcd.setTextColor(WHITE, BLACK);
   lcd.setCursor(4, y);
-  lcd.print("按键说明 (Fn+/ 返回)");
-
+  lcd.print("控制按键 (Fn+/ 翻页)");
   drawBatteryIcon(lcd.width() - 4, y + 2, batteryLevel, batteryCharging);
 
   y += 20;
-
   lcd.setFont(&fonts::efontCN_12);
   lcd.setTextColor(0xC618, BLACK);
 
-  const char* rows[7][2] = {
-    {"C 连接", "X 断开"},
-    {"1 音量-", "2 音量+"},
-    {"M 静音", "I 输入"},
-    {"O 输出", "P 播放暂停"},
-    {"N 下一曲", "B 上一曲"},
-    {"Fn+S 熄屏开关", "Fn+,/. 熄屏时长"},
-    {"Fn+L 亮度档位", "Fn+/ 页面切换"},
+  constexpr const char* rows[][2] = {
+      {"C/X 连接/断开", "1/2 音量-/+"},
+      {"3 音量预设", "0/R 安全/恢复"},
+      {"M 静音", "I/O 输入/输出"},
+      {"U/T USB/光纤", "7/8/9 三种输出"},
+      {"P 播放暂停", "N/B 下一/上一曲"},
+      {"Fn+S 熄屏开关", "Fn+,/. 熄屏时长"},
+      {"Fn+L 亮度", "Fn+E/W 模式/唤醒"},
   };
 
-  for (int row = 0; row < 7; row++) {
+  for (const auto& row : rows) {
     lcd.setCursor(colX[0], y);
-    lcd.print(rows[row][0]);
-
+    lcd.print(row[0]);
     lcd.setCursor(colX[1], y);
-    lcd.print(rows[row][1]);
-
+    lcd.print(row[1]);
     y += 15;
   }
 }
 
+void drawDiagnosticsPage() {
+  auto& lcd = M5Cardputer.Display;
+  int y = 2;
+
+  lcd.setFont(&fonts::efontCN_14);
+  lcd.setTextColor(WHITE, BLACK);
+  lcd.setCursor(4, y);
+  lcd.print("运行诊断 (Fn+/ 返回)");
+  drawBatteryIcon(lcd.width() - 4, y + 2, batteryLevel, batteryCharging);
+
+  y += 22;
+  lcd.setFont(&fonts::efontCN_12);
+  lcd.setTextColor(0xC618, BLACK);
+
+  const uint32_t uptimeSec = millis() / 1000UL;
+  lcd.setCursor(4, y);
+  lcd.printf("运行: %luh %02lum %02lus", static_cast<unsigned long>(uptimeSec / 3600UL),
+             static_cast<unsigned long>((uptimeSec / 60UL) % 60UL),
+             static_cast<unsigned long>(uptimeSec % 60UL));
+  y += 16;
+
+  lcd.setCursor(4, y);
+  lcd.printf("CPU: %uMHz  空闲堆: %uKB", getCpuFrequencyMhz(), ESP.getFreeHeap() / 1024U);
+  y += 16;
+
+  lcd.setCursor(4, y);
+  lcd.printf("BLE功率: %s  队列: %u/%u", ecoModeEnabled ? "-3dBm" : "+3dBm",
+             static_cast<unsigned>(hidQueueCount), static_cast<unsigned>(kHidQueueCapacity));
+  y += 16;
+
+  lcd.setCursor(4, y);
+  lcd.printf("屏幕: %s  NVS待写: %s", screenOff ? "关" : "开", settingsDirty ? "是" : "否");
+  y += 16;
+
+  lcd.setCursor(4, y);
+  lcd.printf("电量轮询: %lus", static_cast<unsigned long>(batteryPollIntervalMs() / 1000UL));
+  y += 16;
+
+  lcd.setTextColor(0x7BEF, BLACK);
+  lcd.setCursor(4, y + 4);
+  lcd.print("固定内存队列 / 非阻塞组合键");
+}
+
 void drawUI() {
   if (screenOff) return;
-
-  auto &lcd = M5Cardputer.Display;
+  auto& lcd = M5Cardputer.Display;
 
   lcd.startWrite();
   lcd.fillScreen(BLACK);
   lcd.setTextSize(1);
-
   if (currentPage == 0) {
     drawStatusPage();
-  } else {
+  } else if (currentPage == 1) {
     drawLegendPage();
+  } else {
+    drawDiagnosticsPage();
   }
-
   lcd.endWrite();
 }
 
-void sendComboKey(char c) {
-  bleKeyboard.press(KEY_LEFT_CTRL);
-  bleKeyboard.press(KEY_LEFT_ALT);
-  bleKeyboard.press(c);
-
-  // 保留短延时，保证主机端稳定识别组合键。
-  delay(15);
-
-  bleKeyboard.releaseAll();
+void serviceUi(uint32_t now) {
+  if (!uiDirty || screenOff) return;
+  if ((now - lastUiDrawMs) < kUiMinRedrawIntervalMs) return;
+  drawUI();
+  lastUiDrawMs = now;
+  uiDirty = false;
 }
 
+// -----------------------------------------------------------------------------
+// Input handling
+// -----------------------------------------------------------------------------
+
 bool handleDx1Key(char c) {
-  if (c >= 'A' && c <= 'Z') {
-    c = c - 'A' + 'a';
-  }
-
-  for (size_t i = 0; i < kActionCount; i++) {
+  c = normalizeKey(c);
+  for (size_t i = 0; i < kActionCount; ++i) {
     if (c != kActions[i].key) continue;
-
     if (!bleKeyboard.isConnected()) {
-      lastActionText = "未连接蓝牙, 无法发送";
-    } else {
-      sendComboKey(kActions[i].sendChar);
-      lastActionText = String("已发送: ") + kActions[i].label;
+      setLastAction("未连接蓝牙，无法发送");
+    } else if (enqueueCombo(kActions[i].sendChar)) {
+      setLastActionf("已发送: %s", kActions[i].label);
     }
-
     return true;
   }
-
   return false;
 }
 
 bool handleMediaKey(char c) {
-  if (c >= 'A' && c <= 'Z') {
-    c = c - 'A' + 'a';
-  }
-
-  for (size_t i = 0; i < kMediaActionCount; i++) {
+  c = normalizeKey(c);
+  for (size_t i = 0; i < kMediaActionCount; ++i) {
     if (c != kMediaActions[i].key) continue;
-
     if (!bleKeyboard.isConnected()) {
-      lastActionText = "未连接蓝牙, 无法发送";
-    } else {
-      bleKeyboard.write(kMediaActions[i].mediaKey);
-      lastActionText = String("媒体: ") + kMediaActions[i].label;
+      setLastAction("未连接蓝牙，无法发送");
+    } else if (enqueueMedia(kMediaActions[i].mediaKey)) {
+      setLastActionf("媒体: %s", kMediaActions[i].label);
     }
-
     return true;
   }
-
   return false;
 }
 
-bool handleSettingsKey(char c) {
-  if (c >= 'A' && c <= 'Z') {
-    c = c - 'A' + 'a';
-  }
+bool handleSettingsKey(char c, uint32_t now) {
+  c = normalizeKey(c);
 
   if (c == 's') {
     autoSleepEnabled = !autoSleepEnabled;
-    prefs.putBool("autoSleep", autoSleepEnabled);
-
-    lastActionText = autoSleepEnabled ? "自动熄屏: 开" : "自动熄屏: 关";
+    markSettingsDirty(now);
+    setLastAction(autoSleepEnabled ? "自动熄屏: 开" : "自动熄屏: 关");
     return true;
   }
 
   if (c == ',') {
-    sleepPresetIndex = (sleepPresetIndex == 0)
-                         ? (kSleepPresetCount - 1)
-                         : (sleepPresetIndex - 1);
-
-    prefs.putUChar("sleepIdx", sleepPresetIndex);
-    lastActionText = String("熄屏时间: ") + kSleepPresetsSec[sleepPresetIndex] + "s";
+    sleepPresetIndex = sleepPresetIndex == 0 ? kSleepPresetCount - 1 : sleepPresetIndex - 1;
+    markSettingsDirty(now);
+    setLastActionf("熄屏时间: %us", kSleepPresetsSec[sleepPresetIndex]);
     return true;
   }
 
   if (c == '.') {
     sleepPresetIndex = (sleepPresetIndex + 1) % kSleepPresetCount;
-
-    prefs.putUChar("sleepIdx", sleepPresetIndex);
-    lastActionText = String("熄屏时间: ") + kSleepPresetsSec[sleepPresetIndex] + "s";
+    markSettingsDirty(now);
+    setLastActionf("熄屏时间: %us", kSleepPresetsSec[sleepPresetIndex]);
     return true;
   }
 
   if (c == '/') {
-    currentPage = currentPage == 0 ? 1 : 0;
-    lastActionText = currentPage == 0 ? "已切换到状态页" : "已切换到按键说明页";
+    currentPage = (currentPage + 1) % 3;
+    setLastAction(currentPage == 0 ? "状态页" : (currentPage == 1 ? "按键页" : "诊断页"));
     return true;
   }
 
   if (c == 'l') {
     brightnessPresetIndex = (brightnessPresetIndex + 1) % kBrightnessPresetCount;
-    prefs.putUChar("brightIdx", brightnessPresetIndex);
+    applyDisplayBrightness();
+    markSettingsDirty(now);
+    setLastActionf("屏幕亮度: %u", currentBrightness());
+    return true;
+  }
 
-    if (!screenOff) {
-      M5Cardputer.Display.setBrightness(currentBrightness());
-    }
+  if (c == 'e') {
+    ecoModeEnabled = !ecoModeEnabled;
+    applyOperatingMode();
+    markSettingsDirty(now);
+    setLastAction(ecoModeEnabled ? "运行模式: 省电" : "运行模式: 高响应");
+    return true;
+  }
 
-    lastActionText = String("屏幕亮度: ") + currentBrightness();
+  if (c == 'w') {
+    wakeOnlyFirstKey = !wakeOnlyFirstKey;
+    markSettingsDirty(now);
+    setLastAction(wakeOnlyFirstKey ? "熄屏首键: 仅唤醒" : "熄屏首键: 唤醒并执行");
     return true;
   }
 
   return false;
 }
 
-/*
-  Cardputer-Adv / newer M5Cardputer Fn-layer fix:
-  不依赖 status.word 判断 Fn+/、Fn+,、Fn+.。
-*/
-bool handleFnSettingsPhysical() {
-  if (!M5Cardputer.Keyboard.isKeyPressed(KEY_FN)) {
-    return false;
-  }
+bool handleFnSettingsPhysical(uint32_t now) {
+  if (!M5Cardputer.Keyboard.isKeyPressed(KEY_FN)) return false;
 
-  if (M5Cardputer.Keyboard.isKeyPressed('s') ||
-      M5Cardputer.Keyboard.isKeyPressed('S')) {
-    return handleSettingsKey('s');
+  constexpr char settingsKeys[] = {'s', ',', '.', '/', 'l', 'e', 'w'};
+  for (char key : settingsKeys) {
+    if (M5Cardputer.Keyboard.isKeyPressed(key) ||
+        ((key >= 'a' && key <= 'z') && M5Cardputer.Keyboard.isKeyPressed(key - 'a' + 'A'))) {
+      return handleSettingsKey(key, now);
+    }
   }
-
-  if (M5Cardputer.Keyboard.isKeyPressed(',')) {
-    return handleSettingsKey(',');
-  }
-
-  if (M5Cardputer.Keyboard.isKeyPressed('.')) {
-    return handleSettingsKey('.');
-  }
-
-  if (M5Cardputer.Keyboard.isKeyPressed('/')) {
-    return handleSettingsKey('/');
-  }
-
-  if (M5Cardputer.Keyboard.isKeyPressed('l') ||
-      M5Cardputer.Keyboard.isKeyPressed('L')) {
-    return handleSettingsKey('l');
-  }
-
   return false;
 }
 
+void beginVolumeHold(char key, uint32_t now) {
+  if (key == '1') {
+    volDownHeld = true;
+    volDownHoldStartMs = now;
+    lastVolDownRepeatMs = now;
+  } else if (key == '2') {
+    volUpHeld = true;
+    volUpHoldStartMs = now;
+    lastVolUpRepeatMs = now;
+  }
+}
+
+void serviceVolumeRepeat(uint32_t now, bool connected) {
+  const bool fnHeld = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
+  const bool downPhysical = !fnHeld && M5Cardputer.Keyboard.isKeyPressed('1');
+  const bool upPhysical = !fnHeld && M5Cardputer.Keyboard.isKeyPressed('2');
+
+  if (!downPhysical) volDownHeld = false;
+  if (!upPhysical) volUpHeld = false;
+  if (!connected) return;
+
+  if (volDownHeld && downPhysical && (now - volDownHoldStartMs) >= kVolumeRepeatInitialDelayMs) {
+    const uint32_t interval = (now - volDownHoldStartMs) >= kVolumeRepeatFastAfterMs
+                                  ? kVolumeRepeatFastMs
+                                  : kVolumeRepeatNormalMs;
+    if ((now - lastVolDownRepeatMs) >= interval && enqueueCombo('1')) {
+      lastVolDownRepeatMs = now;
+      lastActivityMs = now;
+      setLastAction("长按: 音量-");
+    }
+  }
+
+  if (volUpHeld && upPhysical && (now - volUpHoldStartMs) >= kVolumeRepeatInitialDelayMs) {
+    const uint32_t interval = (now - volUpHoldStartMs) >= kVolumeRepeatFastAfterMs
+                                  ? kVolumeRepeatFastMs
+                                  : kVolumeRepeatNormalMs;
+    if ((now - lastVolUpRepeatMs) >= interval && enqueueCombo('2')) {
+      lastVolUpRepeatMs = now;
+      lastActivityMs = now;
+      setLastAction("长按: 音量+");
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Deferred services
+// -----------------------------------------------------------------------------
+
+void flushSettingsIfDue(uint32_t now) {
+  if (!settingsDirty || (now - settingsDirtySinceMs) < kSettingsWriteDelayMs) return;
+
+  prefs.putBool("autoSleep", autoSleepEnabled);
+  prefs.putUChar("sleepIdx", sleepPresetIndex);
+  prefs.putUChar("brightIdx", brightnessPresetIndex);
+  prefs.putBool("ecoMode", ecoModeEnabled);
+  prefs.putBool("wakeOnly", wakeOnlyFirstKey);
+  settingsDirty = false;
+  uiDirty = true;
+}
+
+uint16_t loopDelayMs(bool connected) {
+  // While a key is being transmitted, poll quickly enough to release it on time.
+  if (hidTxPhase != HidTxPhase::Idle || hidQueueCount > 0) return 2;
+
+  if (screenOff) {
+    if (ecoModeEnabled) return connected ? 18 : 35;
+    return connected ? 10 : 20;
+  }
+  if (ecoModeEnabled) return connected ? 7 : 14;
+  return connected ? 4 : 8;
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// Arduino lifecycle
+// -----------------------------------------------------------------------------
+
 void setup() {
   auto cfg = M5.config();
-
-  // 省电：不用的内部硬件直接不初始化。
   cfg.internal_spk = false;
   cfg.internal_mic = false;
   cfg.internal_imu = false;
@@ -555,142 +772,113 @@ void setup() {
   autoSleepEnabled = prefs.getBool("autoSleep", true);
   sleepPresetIndex = prefs.getUChar("sleepIdx", 1);
   brightnessPresetIndex = prefs.getUChar("brightIdx", 1);
+  ecoModeEnabled = prefs.getBool("ecoMode", true);
+  wakeOnlyFirstKey = prefs.getBool("wakeOnly", false);
 
-  if (sleepPresetIndex >= kSleepPresetCount) {
-    sleepPresetIndex = 1;
-  }
-
-  if (brightnessPresetIndex >= kBrightnessPresetCount) {
-    brightnessPresetIndex = 1;
-  }
+  if (sleepPresetIndex >= kSleepPresetCount) sleepPresetIndex = 1;
+  if (brightnessPresetIndex >= kBrightnessPresetCount) brightnessPresetIndex = 1;
 
   M5Cardputer.Display.setBrightness(currentBrightness());
-
-  // 双保险：即使库内部默认初始化过，也主动关闭不用的音频任务。
   M5Cardputer.Speaker.end();
   M5Cardputer.Mic.end();
 
   applyPowerSavingConfigBeforeBle();
-
   bleKeyboard.begin();
-  applyPowerSavingConfigAfterBleBegin();
+  applyOperatingMode();
+  configureAdvertisingForBatteryLife();
 
   refreshBatteryStatus();
   pushBleBatteryLevel();
-  lastBatteryPollMs = millis();
 
-  lastActivityMs = millis();
+  const uint32_t now = millis();
+  lastBatteryPollMs = now;
+  lastActivityMs = now;
+  lastUiDrawMs = now;
   drawUI();
+  uiDirty = false;
 }
 
 void loop() {
   M5Cardputer.update();
+  const uint32_t now = millis();
+  const bool connected = bleKeyboard.isConnected();
 
-  unsigned long now = millis();
-  bool connected = bleKeyboard.isConnected();
-
-  // ---------- 长按音量键连续调节 ----------
-  // 检测音量键是否被按住，实现连续发送组合键
-  bool volDownNow = M5Cardputer.Keyboard.isKeyPressed('1');
-  bool volUpNow = M5Cardputer.Keyboard.isKeyPressed('2');
-
-  if (volDownNow) {
-    if (volDownHeld && bleKeyboard.isConnected() && (now - lastVolDownMs >= kVolRepeatIntervalMs)) {
-      sendComboKey('1');
-      lastVolDownMs = now;
-      lastActivityMs = now;  // 长按期间保持屏幕唤醒，避免自动熄屏
-    }
-  } else {
-    volDownHeld = false;
-  }
-
-  if (volUpNow) {
-    if (volUpHeld && bleKeyboard.isConnected() && (now - lastVolUpMs >= kVolRepeatIntervalMs)) {
-      sendComboKey('2');
-      lastVolUpMs = now;
-      lastActivityMs = now;
-    }
-  } else {
-    volUpHeld = false;
-  }
-  // ---------------------------------------
+  serviceHidTx(now, connected);
+  serviceVolumeRepeat(now, connected);
 
   if (connected != lastConnectedState) {
     lastConnectedState = connected;
+    volDownHeld = false;
+    volUpHeld = false;
 
     if (connected) {
-      delay(150);
-      applyPowerSavingConfigAfterBleBegin();
-      updatePeerAddress();
+      applyOperatingMode();
       pushBleBatteryLevel();
-      lastActionText = "蓝牙已连接";
+      peerRefreshPending = true;
+      peerRefreshDueMs = now + kPeerAddressDelayMs;
+      setLastAction("蓝牙已连接");
     } else {
-      peerAddressText = "";
-      lastActionText = "蓝牙已断开";
+      snprintf(peerAddressText, sizeof(peerAddressText), "-");
+      peerRefreshPending = false;
+      clearHidQueue();
+      setLastAction("蓝牙已断开");
     }
 
     wakeScreen();
-    lastActivityMs = millis();
-    drawUI();
+    lastActivityMs = now;
+    uiDirty = true;
   }
 
-  // 电量低频轮询；变化会同步 BLE HID 电池服务，但不会主动唤醒屏幕。
-  if (now - lastBatteryPollMs >= getBatteryPollIntervalMs()) {
-    lastBatteryPollMs = now;
+  if (peerRefreshPending && connected && timeReached(now, peerRefreshDueMs)) {
+    peerRefreshPending = false;
+    updatePeerAddress();
+    uiDirty = true;
+  }
 
-    if (refreshBatteryStatus() && !screenOff) {
-      drawUI();
-    }
+  if ((now - lastBatteryPollMs) >= batteryPollIntervalMs()) {
+    lastBatteryPollMs = now;
+    refreshBatteryStatus();
   }
 
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
-    bool handled = false;
-    bool wasScreenOff = screenOff;
-
-    // 任意按键先唤醒屏幕并刷新活动时间；无效键不发送蓝牙。
+    const Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    const bool wasScreenOff = screenOff;
     wakeScreen();
-    lastActivityMs = millis();
+    lastActivityMs = now;
 
-    if (M5Cardputer.Keyboard.isKeyPressed(KEY_FN) || status.fn) {
-      handled = handleFnSettingsPhysical();
-    } else {
-      for (auto c : status.word) {
-        if (handleDx1Key(c)) {
-          handled = true;
+    // Optional accidental-press guard: the first key only wakes the display.
+    if (!(wasScreenOff && wakeOnlyFirstKey)) {
+      bool handled = false;
+      const bool fnHeld = M5Cardputer.Keyboard.isKeyPressed(KEY_FN) || status.fn;
 
-          // 记录音量键长按状态，首次按下后启动连续发送计时
-          if (c == '1') {
-            volDownHeld = true;
-            lastVolDownMs = now;
-          } else if (c == '2') {
-            volUpHeld = true;
-            lastVolUpMs = now;
+      if (fnHeld) {
+        handled = handleFnSettingsPhysical(now);
+      } else {
+        for (char rawKey : status.word) {
+          const char key = normalizeKey(rawKey);
+          if (handleDx1Key(key)) {
+            handled = true;
+            if ((key == '1' || key == '2') && connected) beginVolumeHold(key, now);
+            continue;
           }
-
-          continue;
-        }
-
-        if (handleMediaKey(c)) {
-          handled = true;
-          continue;
+          if (handleMediaKey(key)) handled = true;
         }
       }
+
+      if (!handled && wasScreenOff) setLastAction("屏幕已唤醒");
+    } else {
+      setLastAction("屏幕已唤醒，首键未发送");
     }
 
-    // 熄屏状态下任意键唤醒后需要重绘；正常亮屏时只有处理过的键才重绘。
-    if (handled || wasScreenOff) {
-      drawUI();
-    }
+    uiDirty = true;
   }
 
   if (autoSleepEnabled && !screenOff) {
-    unsigned long timeoutMs = (unsigned long)kSleepPresetsSec[sleepPresetIndex] * 1000UL;
-
-    if (millis() - lastActivityMs >= timeoutMs) {
-      turnScreenOff();
-    }
+    const uint32_t timeoutMs = static_cast<uint32_t>(kSleepPresetsSec[sleepPresetIndex]) * 1000UL;
+    if ((now - lastActivityMs) >= timeoutMs) turnScreenOff();
   }
 
-  delay(getLoopDelayMs(connected));
+  flushSettingsIfDue(now);
+  serviceUi(now);
+  delay(loopDelayMs(connected));
 }

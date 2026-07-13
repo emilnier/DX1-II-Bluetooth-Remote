@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>DX1 II 控制中心</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">M5Stack Cardputer · Local Bridge</p>
+        <h1>DX1 II 控制中心</h1>
+        <p class="subtitle">后台全局热键、USB HID 直连、自动重连与实时状态。</p>
+      </div>
+      <div class="connection-card" aria-live="polite">
+        <span id="statusDot" class="status-dot"></span>
+        <div>
+          <strong id="statusText">正在连接服务…</strong>
+          <small id="deviceText">等待状态</small>
+        </div>
+      </div>
+    </header>
+
+    <section class="metrics" aria-label="运行状态">
+      <div><span>最近动作</span><strong id="lastAction">—</strong></div>
+      <div><span>命令计数</span><strong id="commandCount">0</strong></div>
+      <div><span>等待队列</span><strong id="queueDepth">0</strong></div>
+      <div><span>连接策略</span><strong id="reconnectMode">自动</strong></div>
+    </section>
+
+    <div id="errorBanner" class="error-banner" hidden></div>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="panel-title"><h2>设备连接</h2><span class="keycap">C / X</span></div>
+        <div class="button-row">
+          <button data-action="connect" class="primary">连接 DX1 II</button>
+          <button data-action="disconnect">断开并暂停重连</button>
+        </div>
+        <p class="note">重新点击“连接”即可恢复自动重连。</p>
+      </section>
+
+      <section class="panel volume-panel">
+        <div class="panel-title"><h2>音量</h2><span class="keycap">1 / 2</span></div>
+        <div class="volume-readout"><strong id="volumeReadout">-30.0</strong><span>dB</span></div>
+        <input id="volumeSlider" type="range" min="-99" max="0" step="0.5" value="-30" aria-label="音量">
+        <div class="volume-controls">
+          <button data-action="volumeDown" aria-label="降低音量">−</button>
+          <input id="volumeInput" type="number" min="-99" max="0" step="0.5" value="-30" aria-label="音量 dB">
+          <button data-action="volumeUp" aria-label="提高音量">＋</button>
+          <button id="applyVolume" class="primary">应用</button>
+        </div>
+        <div class="button-row compact">
+          <button data-action="volumePreset">循环预设</button>
+          <button data-action="safeVolume">安全音量</button>
+          <button data-action="restoreVolume">恢复音量</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title"><h2>静音</h2><span class="keycap">M</span></div>
+        <button id="muteButton" data-action="muteToggle" class="wide">静音切换</button>
+        <p class="note">显示的是桥接服务的推定状态；设备旋钮在外部改变时可能不同步。</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title"><h2>输入</h2><span class="keycap">I · U · T</span></div>
+        <div class="segmented">
+          <button data-action="setInput" data-value="0" id="input0">USB</button>
+          <button data-action="setInput" data-value="1" id="input1">OPT</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title"><h2>输出</h2><span class="keycap">O · 7/8/9</span></div>
+        <div class="segmented three">
+          <button data-action="setOutput" data-value="0" id="output0">耳放</button>
+          <button data-action="setOutput" data-value="1" id="output1">LO</button>
+          <button data-action="setOutput" data-value="2" id="output2">ALL</button>
+        </div>
+      </section>
+
+      <section class="panel shortcuts">
+        <div class="panel-title"><h2>Cardputer 快捷键</h2></div>
+        <dl>
+          <div><dt>C / X</dt><dd>连接 / 断开</dd></div>
+          <div><dt>1 / 2</dt><dd>音量降低 / 提高，支持长按加速</dd></div>
+          <div><dt>3</dt><dd>循环音量预设</dd></div>
+          <div><dt>0 / R</dt><dd>安全音量 / 恢复此前音量</dd></div>
+          <div><dt>M · I · O</dt><dd>静音 / 输入切换 / 输出切换</dd></div>
+          <div><dt>U · T</dt><dd>直接选择 USB / 光纤</dd></div>
+          <div><dt>7 · 8 · 9</dt><dd>直接选择耳放 / LO / ALL</dd></div>
+          <div><dt>P · N · B</dt><dd>系统播放暂停 / 下一曲 / 上一曲</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    <section class="panel log-panel">
+      <div class="panel-title">
+        <h2>运行日志</h2>
+        <button id="clearLog" class="ghost">清空显示</button>
+      </div>
+      <div id="log" class="log" role="log" aria-live="polite"></div>
+    </section>
+
+    <footer>仅监听 <code>127.0.0.1</code>，控制请求不会暴露到局域网。</footer>
+  </main>
+</body>
+</html>
