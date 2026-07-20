@@ -2,11 +2,19 @@
   DX1 II Bluetooth Remote for M5Stack Cardputer-Adv
   =================================================
 
-  Goals of this revision:
+  Storage-life revision:
+  - The sketch does not mount or write the microSD card.
+  - Five related settings are packed into one uint32_t NVS entry.
+  - Settings are compared before writing, then saved after 30 s of quiet.
+  - A 5 minute maximum deferral prevents endless postponement.
+  - Successful NVS writes are rate-limited to one per minute.
+  - Writes are deferred at critically low battery voltage.
+  - NVS failures are retried slowly and exposed on the diagnostics page.
+
+  Other goals:
   - Low idle power without sacrificing BLE keyboard reliability.
   - No blocking delay in HID key transmission.
   - Bounded memory usage; avoid long-lived Arduino String fragmentation.
-  - Debounced NVS writes to reduce flash wear.
   - Coalesced display refreshes to reduce SPI traffic and flicker.
   - Useful local settings and diagnostics.
 
@@ -57,13 +65,12 @@
 
 #include <BleKeyboard.h>
 #include <NimBLEDevice.h>
-#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <nvs.h>
 #include <stdarg.h>
 
 BleKeyboard bleKeyboard("DX1II Remote", "M5Stack", 100);
-Preferences prefs;
 
 namespace {
 
@@ -112,9 +119,18 @@ constexpr size_t kBrightnessPresetCount = sizeof(kBrightnessPresets) / sizeof(kB
 constexpr bool kUseDisplayControllerSleep = false;
 constexpr uint32_t kBatteryPollAwakeMs = 30000;
 constexpr uint32_t kBatteryPollScreenOffMs = 120000;
-constexpr uint32_t kSettingsWriteDelayMs = 2500;
+constexpr uint32_t kSettingsQuietDelayMs = 30000;
+constexpr uint32_t kSettingsMaxDeferralMs = 300000;
+constexpr uint32_t kSettingsMinWriteIntervalMs = 60000;
+constexpr uint32_t kSettingsRetryDelayMs = 10000;
+constexpr int32_t kMinBatteryPercentForNvsWrite = 5;
 constexpr uint32_t kUiMinRedrawIntervalMs = 30;
 constexpr uint32_t kPeerAddressDelayMs = 250;
+
+constexpr char kSettingsNamespace[] = "dx1remote";
+constexpr char kPackedSettingsKey[] = "cfg2";
+constexpr uint32_t kSettingsMagic = 0xD1000000UL;
+constexpr uint32_t kSettingsMagicMask = 0xFF000000UL;
 
 constexpr uint16_t kComboHoldMs = 14;
 constexpr uint16_t kInterHidEventGapMs = 8;
@@ -131,8 +147,8 @@ constexpr uint16_t kAdvertisingMaxInterval = 240;
 
 constexpr uint32_t kEcoCpuMhz = 80;
 constexpr uint32_t kResponsiveCpuMhz = 160;
-constexpr esp_power_level_t kEcoBleTxPower = ESP_PWR_LVL_N3;   // -3 dBm
-constexpr esp_power_level_t kResponsiveBleTxPower = ESP_PWR_LVL_P3;  // +3 dBm
+constexpr esp_power_level_t kEcoBleTxPower = ESP_PWR_LVL_N3;
+constexpr esp_power_level_t kResponsiveBleTxPower = ESP_PWR_LVL_P3;
 
 // -----------------------------------------------------------------------------
 // Runtime state
@@ -160,6 +176,12 @@ uint32_t lastBatteryPollMs = 0;
 
 bool settingsDirty = false;
 uint32_t settingsDirtySinceMs = 0;
+uint32_t settingsFirstDirtyMs = 0;
+uint32_t lastSettingsWriteMs = 0;
+uint32_t lastSettingsAttemptMs = 0;
+uint32_t persistedSettingsWord = 0;
+uint32_t settingsSaveCount = 0;
+uint32_t settingsSaveFailures = 0;
 
 bool uiDirty = true;
 uint32_t lastUiDrawMs = 0;
@@ -204,7 +226,6 @@ uint8_t currentBrightness() {
 
 uint8_t effectiveBrightness() {
   uint8_t brightness = currentBrightness();
-  // A gentle emergency dim preserves usability while extending the final minutes.
   if (!batteryCharging && batteryLevel >= 0 && batteryLevel <= 10) {
     brightness = brightness < 18 ? brightness : 18;
   }
@@ -216,8 +237,10 @@ uint32_t batteryPollIntervalMs() {
 }
 
 void markSettingsDirty(uint32_t now) {
+  if (!settingsDirty) settingsFirstDirtyMs = now;
   settingsDirty = true;
   settingsDirtySinceMs = now;
+  uiDirty = true;
 }
 
 void applyDisplayBrightness() {
@@ -241,6 +264,110 @@ void applyPowerSavingConfigBeforeBle() {
   WiFi.mode(WIFI_OFF);
   esp_wifi_stop();
   setCpuFrequencyMhz(ecoModeEnabled ? kEcoCpuMhz : kResponsiveCpuMhz);
+}
+
+// -----------------------------------------------------------------------------
+// Wear-conscious settings persistence
+// -----------------------------------------------------------------------------
+
+uint32_t packSettings() {
+  uint32_t word = kSettingsMagic;
+  word |= autoSleepEnabled ? (1UL << 0) : 0;
+  word |= (static_cast<uint32_t>(sleepPresetIndex) & 0x07UL) << 1;
+  word |= (static_cast<uint32_t>(brightnessPresetIndex) & 0x07UL) << 4;
+  word |= ecoModeEnabled ? (1UL << 7) : 0;
+  word |= wakeOnlyFirstKey ? (1UL << 8) : 0;
+  return word;
+}
+
+bool unpackSettings(uint32_t word) {
+  if ((word & kSettingsMagicMask) != kSettingsMagic) return false;
+
+  const uint8_t decodedSleep = static_cast<uint8_t>((word >> 1) & 0x07UL);
+  const uint8_t decodedBrightness = static_cast<uint8_t>((word >> 4) & 0x07UL);
+  if (decodedSleep >= kSleepPresetCount || decodedBrightness >= kBrightnessPresetCount) return false;
+
+  autoSleepEnabled = (word & (1UL << 0)) != 0;
+  sleepPresetIndex = decodedSleep;
+  brightnessPresetIndex = decodedBrightness;
+  ecoModeEnabled = (word & (1UL << 7)) != 0;
+  wakeOnlyFirstKey = (word & (1UL << 8)) != 0;
+  return true;
+}
+
+void loadSettings() {
+  nvs_handle_t handle = 0;
+  const esp_err_t openResult = nvs_open(kSettingsNamespace, NVS_READONLY, &handle);
+  if (openResult != ESP_OK) {
+    persistedSettingsWord = packSettings();
+    return;
+  }
+
+  uint32_t packed = 0;
+  if (nvs_get_u32(handle, kPackedSettingsKey, &packed) == ESP_OK && unpackSettings(packed)) {
+    persistedSettingsWord = packed;
+    nvs_close(handle);
+    return;
+  }
+
+  // Read the previous revision's keys without rewriting them during migration.
+  uint8_t value = 0;
+  if (nvs_get_u8(handle, "autoSleep", &value) == ESP_OK) autoSleepEnabled = value != 0;
+  if (nvs_get_u8(handle, "sleepIdx", &value) == ESP_OK && value < kSleepPresetCount) {
+    sleepPresetIndex = value;
+  }
+  if (nvs_get_u8(handle, "brightIdx", &value) == ESP_OK && value < kBrightnessPresetCount) {
+    brightnessPresetIndex = value;
+  }
+  if (nvs_get_u8(handle, "ecoMode", &value) == ESP_OK) ecoModeEnabled = value != 0;
+  if (nvs_get_u8(handle, "wakeOnly", &value) == ESP_OK) wakeOnlyFirstKey = value != 0;
+
+  nvs_close(handle);
+  persistedSettingsWord = packSettings();
+}
+
+bool writePackedSettings(uint32_t packed) {
+  nvs_handle_t handle = 0;
+  esp_err_t result = nvs_open(kSettingsNamespace, NVS_READWRITE, &handle);
+  if (result != ESP_OK) return false;
+
+  result = nvs_set_u32(handle, kPackedSettingsKey, packed);
+  if (result == ESP_OK) result = nvs_commit(handle);
+  nvs_close(handle);
+  return result == ESP_OK;
+}
+
+void flushSettingsIfDue(uint32_t now) {
+  if (!settingsDirty) return;
+
+  const bool quietPeriodElapsed = (now - settingsDirtySinceMs) >= kSettingsQuietDelayMs;
+  const bool maxDeferralElapsed = (now - settingsFirstDirtyMs) >= kSettingsMaxDeferralMs;
+  if (!quietPeriodElapsed && !maxDeferralElapsed) return;
+
+  if (lastSettingsWriteMs != 0 && (now - lastSettingsWriteMs) < kSettingsMinWriteIntervalMs) return;
+  if (lastSettingsAttemptMs != 0 && (now - lastSettingsAttemptMs) < kSettingsRetryDelayMs) return;
+
+  const uint32_t packed = packSettings();
+  if (packed == persistedSettingsWord) {
+    settingsDirty = false;
+    uiDirty = true;
+    return;
+  }
+
+  // Avoid starting an erase/program operation when the battery is nearly empty.
+  if (!batteryCharging && batteryLevel >= 0 && batteryLevel <= kMinBatteryPercentForNvsWrite) return;
+
+  lastSettingsAttemptMs = now;
+  if (writePackedSettings(packed)) {
+    persistedSettingsWord = packed;
+    settingsDirty = false;
+    lastSettingsWriteMs = now;
+    ++settingsSaveCount;
+  } else {
+    ++settingsSaveFailures;
+    setLastAction("NVS保存失败，将稍后重试");
+  }
+  uiDirty = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -364,7 +491,8 @@ void updatePeerAddress() {
   if (!server || server->getConnectedCount() == 0) return;
 
   const NimBLEConnInfo info = server->getPeerInfo(0);
-  snprintf(peerAddressText, sizeof(peerAddressText), "%s", const_cast<NimBLEConnInfo&>(info).getAddress().toString().c_str());
+  snprintf(peerAddressText, sizeof(peerAddressText), "%s",
+           const_cast<NimBLEConnInfo&>(info).getAddress().toString().c_str());
 }
 
 // -----------------------------------------------------------------------------
@@ -540,7 +668,9 @@ void drawDiagnosticsPage() {
   y += 16;
 
   lcd.setCursor(4, y);
-  lcd.printf("屏幕: %s  NVS待写: %s", screenOff ? "关" : "开", settingsDirty ? "是" : "否");
+  lcd.printf("NVS待写:%s 成功:%lu 失败:%lu", settingsDirty ? "是" : "否",
+             static_cast<unsigned long>(settingsSaveCount),
+             static_cast<unsigned long>(settingsSaveFailures));
   y += 16;
 
   lcd.setCursor(4, y);
@@ -549,7 +679,7 @@ void drawDiagnosticsPage() {
 
   lcd.setTextColor(0x7BEF, BLACK);
   lcd.setCursor(4, y + 4);
-  lcd.print("固定内存队列 / 非阻塞组合键");
+  lcd.print("单条设置 / 写前比较 / 30秒去抖");
 }
 
 void drawUI() {
@@ -722,24 +852,7 @@ void serviceVolumeRepeat(uint32_t now, bool connected) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Deferred services
-// -----------------------------------------------------------------------------
-
-void flushSettingsIfDue(uint32_t now) {
-  if (!settingsDirty || (now - settingsDirtySinceMs) < kSettingsWriteDelayMs) return;
-
-  prefs.putBool("autoSleep", autoSleepEnabled);
-  prefs.putUChar("sleepIdx", sleepPresetIndex);
-  prefs.putUChar("brightIdx", brightnessPresetIndex);
-  prefs.putBool("ecoMode", ecoModeEnabled);
-  prefs.putBool("wakeOnly", wakeOnlyFirstKey);
-  settingsDirty = false;
-  uiDirty = true;
-}
-
 uint16_t loopDelayMs(bool connected) {
-  // While a key is being transmitted, poll quickly enough to release it on time.
   if (hidTxPhase != HidTxPhase::Idle || hidQueueCount > 0) return 2;
 
   if (screenOff) {
@@ -768,15 +881,7 @@ void setup() {
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Display.setRotation(1);
 
-  prefs.begin("dx1remote", false);
-  autoSleepEnabled = prefs.getBool("autoSleep", true);
-  sleepPresetIndex = prefs.getUChar("sleepIdx", 1);
-  brightnessPresetIndex = prefs.getUChar("brightIdx", 1);
-  ecoModeEnabled = prefs.getBool("ecoMode", true);
-  wakeOnlyFirstKey = prefs.getBool("wakeOnly", false);
-
-  if (sleepPresetIndex >= kSleepPresetCount) sleepPresetIndex = 1;
-  if (brightnessPresetIndex >= kBrightnessPresetCount) brightnessPresetIndex = 1;
+  loadSettings();
 
   M5Cardputer.Display.setBrightness(currentBrightness());
   M5Cardputer.Speaker.end();
@@ -846,7 +951,6 @@ void loop() {
     wakeScreen();
     lastActivityMs = now;
 
-    // Optional accidental-press guard: the first key only wakes the display.
     if (!(wasScreenOff && wakeOnlyFirstKey)) {
       bool handled = false;
       const bool fnHeld = M5Cardputer.Keyboard.isKeyPressed(KEY_FN) || status.fn;
